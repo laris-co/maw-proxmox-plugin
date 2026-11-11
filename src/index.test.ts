@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { baseUrl, bytes, dur, jobCovers, NO_CREDS, parse, run, table, taskState, vmidList } from "./index";
+import { baseUrl, bytes, dur, jobCovers, mergeEnv, NO_CREDS, parse, run, table, taskState, vmidList, type Store } from "./index";
 
 // All values here are fake: pve.example.test, node "pve-a", VMs "vm-a"/"vm-b"/"vm-c".
 const HOST = "pve.example.test";
@@ -211,4 +211,82 @@ test("source has no write endpoints", () => {
   for (const bad of ["/status/start", "/status/stop", "/status/shutdown", "/status/reboot", "method: \"PUT\"", "method: \"DELETE\"", "vzdump\"", "/clone", "/resize"]) {
     expect(src.includes(bad)).toBe(false);
   }
+});
+
+// ---------- saved config + ticket reuse ----------
+function memStore(cfg: Record<string, any> = {}, t0 = 1_000_000) {
+  const st = { cfg, ticket: null as any, clock: t0, writes: 0 };
+  const store: Store = {
+    configPath: () => "/fake/config.json",
+    readConfig: () => ({ ...st.cfg }),
+    writeConfig: (c) => { st.cfg = c; st.writes++; },
+    readTicket: () => st.ticket,
+    writeTicket: (t) => { st.ticket = t; },
+    now: () => st.clock,
+  };
+  return { st, store };
+}
+async function goS(args: string[], env: Record<string, string>, store: Store, m = mock(), pass = (_: string) => null as string | null) {
+  const r = await run(args, { env, fetch: m.fetch as any, pass, log: () => {}, store });
+  return { r, calls: m.calls };
+}
+
+test("config set / show / unset; secrets refused", async () => {
+  const { st, store } = memStore();
+  expect((await goS(["config", "set", `host=${HOST}`, "user=reader@pve", "pass_entry=x/y", "insecure=1", "ours=201,202"], {}, store)).r.ok).toBe(true);
+  expect(st.cfg).toEqual({ host: HOST, user: "reader@pve", pass_entry: "x/y", insecure: "1", ours: "201,202" });
+  expect((await goS(["config", "set", "node", "pve-a"], {}, store)).r.ok).toBe(true);
+  expect(st.cfg.node).toBe("pve-a");
+  const bad = await goS(["config", "set", "password=hunter2"], {}, store);
+  expect(bad.r.ok).toBe(false); expect(bad.r.error).toMatch(/refusing/); expect(JSON.stringify(st.cfg)).not.toContain("hunter2");
+  expect((await goS(["config", "set", "nope=1"], {}, store)).r.ok).toBe(false);
+  const show = await goS(["config"], { PVE_USER: "other@pve" }, store);
+  expect(show.r.output).toContain("/fake/config.json"); expect(show.r.output).toContain("env PVE_USER overrides");
+  expect((await goS(["config", "unset", "node"], {}, store)).r.ok).toBe(true);
+  expect(st.cfg.node).toBeUndefined();
+});
+
+test("mergeEnv: env wins, config fills gaps", () => {
+  const e = mergeEnv({ PVE_USER: "env@pve", PVE_NODE: "" }, { host: HOST, user: "cfg@pve", node: "pve-a" });
+  expect(e).toMatchObject({ PVE_HOST: HOST, PVE_USER: "env@pve", PVE_NODE: "pve-a" });
+});
+
+test("commands run from saved config alone (no env)", async () => {
+  const { store } = memStore({ host: HOST, node: "pve-a", token_id: "reader@pve!ro" });
+  // token secret is never saved, so token auth needs env secret; here password via pass entry instead
+  const { store: s2 } = memStore({ host: HOST, node: "pve-a", user: "reader@pve", pass_entry: "x/y" });
+  const { r, calls } = await goS(["vms"], {}, s2, mock(), () => "pw-from-pass");
+  expect(r.ok).toBe(true); expect(r.output).toContain("vm-a");
+  expect(calls.filter((c) => c.url.endsWith("/access/ticket")).length).toBe(1);
+  expect(store.readConfig().token_secret).toBeUndefined();
+});
+
+test("ticket cached and reused across runs; expiry forces fresh login", async () => {
+  const { st, store } = memStore({ host: HOST, node: "pve-a", user: "reader@pve", pass_entry: "x/y" });
+  const pass = () => "pw";
+  const a = await goS(["vms"], {}, store, mock(), pass);
+  expect(a.calls.filter((c) => c.url.endsWith("/access/ticket")).length).toBe(1);
+  expect(st.ticket.ticket).toBe("PVE:fake-ticket");
+  let passCalls = 0;
+  const b = await goS(["vms"], {}, store, mock(), () => { passCalls++; return "pw"; });
+  expect(b.r.ok).toBe(true);
+  expect(b.calls.filter((c) => c.url.endsWith("/access/ticket")).length).toBe(0);
+  expect(passCalls).toBe(0);
+  st.clock += 111 * 60 * 1000;
+  const c = await goS(["vms"], {}, store, mock(), pass);
+  expect(c.calls.filter((x) => x.url.endsWith("/access/ticket")).length).toBe(1);
+});
+
+test("stale cached ticket (401) is dropped and login retried once", async () => {
+  const { st, store } = memStore({ host: HOST, node: "pve-a", user: "reader@pve", pass_entry: "x/y" });
+  st.ticket = { base: BASE, user: "reader@pve", ticket: "PVE:stale", expires: st.clock + 1e9 };
+  const m = mock();
+  const inner = m.fetch;
+  const f = async (url: string, init: any = {}) =>
+    String(init.headers?.Cookie ?? "").includes("PVE:stale") ? new Response("no", { status: 401 }) : inner(url, init);
+  const { r } = await goS(["vms"], {}, store, { calls: m.calls, fetch: f as any }, () => "pw");
+  expect(r.ok).toBe(true);
+  expect(st.ticket.ticket).toBe("PVE:fake-ticket");
+  expect((await goS(["logout"], {}, store)).r.ok).toBe(true);
+  expect(st.ticket).toBeNull();
 });

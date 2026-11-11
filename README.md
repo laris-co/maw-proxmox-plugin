@@ -2,6 +2,29 @@
 
 `maw proxmox` is a **read-only** view of a Proxmox VE host through its REST API (`/api2/json`).
 
+## Install
+
+```
+maw plugin install laris-co/maw-proxmox-plugin
+maw proxmox --help
+```
+
+Update: `maw plugin update proxmox`
+
+## Quick start
+
+Save your settings once (stored in `~/.config/maw-proxmox/config.json`, mode 0600). Passwords are never saved: point `pass_entry` at your `pass` store instead.
+
+```
+maw proxmox config set host=<host>:8006 user=<user>@pve pass_entry=<pass/entry> insecure=1 ours=<vmid,vmid>
+maw proxmox config            # show what is saved
+maw proxmox status
+maw proxmox vms
+maw proxmox tasks --failed
+```
+
+After the first login the ticket is cached for ~1h50m (`~/.cache/maw-proxmox/ticket.json`, 0600), so `pass`/gpg is not asked again on every command. `maw proxmox logout` forgets it. Environment variables always override the saved config.
+
 ```
 maw proxmox status                        node cpu / mem / rootfs / uptime / version
 maw proxmox vms                           all qemu VMs: vmid name status cpus mem uptime
@@ -29,6 +52,8 @@ Nothing about any host is stored in this repo. Everything comes from the environ
 | `PVE_USER` + `PVE_PASS_ENTRY` | same, with the password read from `pass show <entry>` (first line) |
 | `PVE_OURS` | comma or space list of vmids for `maw proxmox ours` |
 
+Each of these can also be saved with `maw proxmox config set` (keys `host node user pass_entry token_id insecure ours`). Env wins over the saved file.
+
 The token is used if both token variables are set; otherwise ticket login. With neither, the command stops with a message listing these options and sends no request. Secrets are never printed; `--debug` prints only lengths and booleans.
 
 Example:
@@ -51,18 +76,7 @@ A host may run VMs that belong to someone else (for example a client's VM). Any 
 - `ours` counts a VM as covered by a job when the job is enabled and lists the vmid, or is an `all` job that does not exclude it. Pool-based jobs are not resolved and are shown as `pool:<name>` in `backups`.
 - Times are shown in the local time zone (`TZ`).
 
-## Install
-
-One line, straight from GitHub (no clone needed):
-
-```
-maw plugin install laris-co/maw-proxmox-plugin
-maw proxmox --help
-```
-
-Update later with `maw plugin update proxmox`.
-
-From a local checkout instead (for development):
+## Development
 
 ```
 ghq get https://github.com/laris-co/maw-proxmox-plugin

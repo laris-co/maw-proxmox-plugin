@@ -26,7 +26,12 @@ type PluginResult = { ok: boolean; output?: string; error?: string };
 type Env = Record<string, string | undefined>;
 type FetchFn = (url: string, init?: RequestInit & { tls?: { rejectUnauthorized?: boolean } }) => Promise<Response>;
 type PassFn = (entry: string) => string | null;
-type Deps = { env: Env; fetch: FetchFn; pass: PassFn; log: (s: string) => void };
+export type Store = {
+  readConfig(): J; writeConfig(c: J): void; configPath(): string;
+  readTicket(): J | null; writeTicket(t: J | null): void;
+  now(): number;
+};
+type Deps = { env: Env; fetch: FetchFn; pass: PassFn; log: (s: string) => void; store?: Store };
 type J = Record<string, any>;
 
 const HELP = `maw proxmox — read-only Proxmox VE view
@@ -40,11 +45,18 @@ const HELP = `maw proxmox — read-only Proxmox VE view
   maw proxmox ours [--ours 1,2,3]           only the listed VMs (default $PVE_OURS) with backup coverage
   maw proxmox storage                       storage pools: used / total
 
+  maw proxmox config                        show saved settings (and the file path)
+  maw proxmox config set k=v [k=v ...]      save: host node user pass_entry token_id insecure ours
+  maw proxmox config unset <key>            remove one saved setting
+  maw proxmox logout                        forget the cached login ticket
+
   --json  JSON output    --insecure  accept self-signed cert ($PVE_INSECURE=1)    --debug  auth diagnostics
 
   env: PVE_HOST (required) PVE_NODE (auto-detected if unset)
        PVE_TOKEN_ID + PVE_TOKEN_SECRET      or   PVE_USER + PVE_PASSWORD | PVE_PASS_ENTRY (pass show)
        PVE_OURS  vmid list for 'ours'
+  saved config (~/.config/maw-proxmox/config.json) fills in anything env leaves unset; env always wins.
+  passwords / token secrets are never saved; a ticket login is cached ~1h50m (0600) and reused.
   read-only: no start/stop/create/delete/config-write calls exist in this plugin.`;
 
 // ---------- args ----------
@@ -84,6 +96,42 @@ export function vmidList(s: string | undefined): number[] {
 
 const truthy = (v: string | undefined) => !!v && /^(1|true|yes|on)$/i.test(v);
 
+// ---------- saved config ----------
+// key in config.json -> env var it fills. Secrets (password, token secret) are deliberately absent.
+export const CONFIG_KEYS: Record<string, string> = {
+  host: "PVE_HOST", node: "PVE_NODE", user: "PVE_USER", pass_entry: "PVE_PASS_ENTRY",
+  token_id: "PVE_TOKEN_ID", insecure: "PVE_INSECURE", ours: "PVE_OURS",
+};
+const SECRET_KEYS = ["password", "pass", "token_secret", "secret", "ticket"];
+
+/** env wins; saved config fills only what env leaves unset or empty. */
+export function mergeEnv(env: Env, cfg: J): Env {
+  const out: Env = { ...env };
+  for (const [k, v] of Object.entries(CONFIG_KEYS)) {
+    if ((out[v] === undefined || out[v] === "") && cfg[k] !== undefined && cfg[k] !== "") out[v] = String(cfg[k]);
+  }
+  return out;
+}
+
+export function configSet(cfg: J, pairs: string[]): J {
+  const next = { ...cfg };
+  const items: [string, string][] = [];
+  if (pairs.length === 2 && !pairs[0]!.includes("=")) items.push([pairs[0]!, pairs[1]!]);
+  else for (const p of pairs) {
+    const i = p.indexOf("=");
+    if (i < 1) throw new Error(`expected key=value, got: ${p}`);
+    items.push([p.slice(0, i), p.slice(i + 1)]);
+  }
+  if (!items.length) throw new Error("usage: maw proxmox config set key=value [key=value ...]");
+  for (const [rawK, v] of items) {
+    const k = rawK.toLowerCase().replace(/-/g, "_");
+    if (SECRET_KEYS.includes(k)) throw new Error(`refusing to save '${k}': secrets stay in pass or env, never in the config file (use pass_entry)`);
+    if (!(k in CONFIG_KEYS)) throw new Error(`unknown key '${rawK}'. keys: ${Object.keys(CONFIG_KEYS).join(" ")}`);
+    next[k] = v;
+  }
+  return next;
+}
+
 // ---------- auth ----------
 export type Auth = { kind: "token" | "ticket"; headers: Record<string, string> };
 
@@ -110,6 +158,7 @@ export class Api {
   base: string;
   node?: string;
   auth?: Auth;
+  cachedTicket = false;
   constructor(private d: Deps, private insecure: boolean) {
     this.base = baseUrl(d.env.PVE_HOST);
     this.node = d.env.PVE_NODE || undefined;
@@ -123,6 +172,12 @@ export class Api {
     if (e.PVE_TOKEN_ID && e.PVE_TOKEN_SECRET) {
       return (this.auth = { kind: "token", headers: { Authorization: `PVEAPIToken=${e.PVE_TOKEN_ID}=${e.PVE_TOKEN_SECRET}` } });
     }
+    const st = this.d.store;
+    const cached = st?.readTicket();
+    if (cached && cached.base === this.base && cached.user === e.PVE_USER && Number(cached.expires) > (st!.now())) {
+      this.cachedTicket = true;
+      return (this.auth = { kind: "ticket", headers: { Cookie: `PVEAuthCookie=${cached.ticket}` } });
+    }
     let pw = e.PVE_PASSWORD;
     if (!pw && e.PVE_USER && e.PVE_PASS_ENTRY) pw = this.d.pass(e.PVE_PASS_ENTRY) ?? undefined;
     if (!e.PVE_USER || !pw) throw new Error(NO_CREDS);
@@ -131,11 +186,19 @@ export class Api {
     if (!r.ok) throw new Error(`ticket login failed: HTTP ${r.status} (check PVE_USER / password)`);
     const t = ((await r.json()) as J)?.data?.ticket;
     if (!t) throw new Error("ticket login failed: no ticket in response");
+    // Proxmox tickets live 2h; reuse for 1h50m.
+    st?.writeTicket({ base: this.base, user: e.PVE_USER, ticket: t, expires: st.now() + 110 * 60 * 1000 });
     return (this.auth = { kind: "ticket", headers: { Cookie: `PVEAuthCookie=${t}` } });
   }
   async get<T = any>(path: string): Promise<T> {
-    const a = await this.login();
-    const r = await this.d.fetch(`${this.base}${path}`, this.init({ method: "GET", headers: a.headers }));
+    let a = await this.login();
+    let r = await this.d.fetch(`${this.base}${path}`, this.init({ method: "GET", headers: a.headers }));
+    if (r.status === 401 && this.cachedTicket) {
+      // stale cached ticket: forget it and log in once more
+      this.d.store?.writeTicket(null); this.auth = undefined; this.cachedTicket = false;
+      a = await this.login();
+      r = await this.d.fetch(`${this.base}${path}`, this.init({ method: "GET", headers: a.headers }));
+    }
     if (r.status === 401) throw new Error(`HTTP 401 on ${path} (${a.kind} auth rejected)`);
     if (!r.ok) throw new Error(`HTTP ${r.status} on ${path}: ${(await r.text()).slice(0, 200)}`);
     return ((await r.json()) as J).data as T;
@@ -212,6 +275,30 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
   const js = (v: unknown): PluginResult => ok(JSON.stringify(v, null, 1));
   const fail = (error: string): PluginResult => ({ ok: false, error });
   if (o.verb === "help") return ok(HELP);
+
+  if (o.verb === "config") {
+    if (!d.store) return fail("no config store available");
+    try {
+      const cfg = d.store.readConfig();
+      const sub = o.rest[0];
+      if (!sub || sub === "show") {
+        if (o.json) return js({ path: d.store.configPath(), config: cfg });
+        const rows = Object.keys(CONFIG_KEYS).map((k) => [k, cfg[k] ?? "-", d.env[CONFIG_KEYS[k]!] ? `env ${CONFIG_KEYS[k]} overrides` : ""]);
+        return ok(`${d.store.configPath()}\n${table(["key", "saved", "note"], rows)}`);
+      }
+      if (sub === "path") return ok(d.store.configPath());
+      if (sub === "set") { const next = configSet(cfg, o.rest.slice(1)); d.store.writeConfig(next); return ok(`saved to ${d.store.configPath()}`); }
+      if (sub === "unset") {
+        const k = (o.rest[1] ?? "").toLowerCase().replace(/-/g, "_");
+        if (!(k in CONFIG_KEYS)) return fail(`unknown key '${o.rest[1] ?? ""}'. keys: ${Object.keys(CONFIG_KEYS).join(" ")}`);
+        const next = { ...cfg }; delete next[k]; d.store.writeConfig(next); return ok(`removed ${k}`);
+      }
+      return fail(`usage: maw proxmox config [show|path|set k=v ...|unset key]`);
+    } catch (e) { return fail((e as Error).message); }
+  }
+  if (o.verb === "logout") { d.store?.writeTicket(null); return ok("cached ticket removed"); }
+
+  if (d.store) d = { ...d, env: mergeEnv(d.env, d.store.readConfig()) };
   const known = ["status", "vms", "vm", "tasks", "task-log", "backups", "ours", "storage"];
   if (!known.includes(o.verb)) return fail(`unknown command: ${o.verb}\n\n${HELP}`);
 
@@ -335,8 +422,31 @@ function passShow(entry: string): string | null {
   }
 }
 
+export function fileStore(env: Env = process.env): Store {
+  const { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSync } = require("node:fs") as typeof import("node:fs");
+  const { join, dirname } = require("node:path") as typeof import("node:path");
+  const home = env.HOME ?? "";
+  const cfgPath = join(env.XDG_CONFIG_HOME || join(home, ".config"), "maw-proxmox", "config.json");
+  const tktPath = join(env.XDG_CACHE_HOME || join(home, ".cache"), "maw-proxmox", "ticket.json");
+  const read = (p: string): J | null => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } };
+  const write = (p: string, v: J) => {
+    mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify(v, null, 2) + "\n", { mode: 0o600 });
+    chmodSync(tmp, 0o600); renameSync(tmp, p);
+  };
+  return {
+    configPath: () => cfgPath,
+    readConfig: () => read(cfgPath) ?? {},
+    writeConfig: (c) => write(cfgPath, c),
+    readTicket: () => read(tktPath),
+    writeTicket: (t) => { if (t) write(tktPath, t); else if (existsSync(tktPath)) write(tktPath, {}); },
+    now: () => Date.now(),
+  };
+}
+
 export async function handler(ctx: InvokeContext): Promise<PluginResult> {
-  return run(ctx.args, { env: process.env, fetch: fetch as unknown as FetchFn, pass: passShow, log: (s) => console.error(s) });
+  return run(ctx.args, { env: process.env, fetch: fetch as unknown as FetchFn, pass: passShow, log: (s) => console.error(s), store: fileStore() });
 }
 
 export default handler;
