@@ -1,13 +1,13 @@
 {
   "name": "proxmox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "entry": "./src/index.ts",
   "sdk": "^1.0.0",
   "target": "js",
-  "description": "Proxmox VE view (read-only: node status, VMs, inventory, tasks, task logs, backups, storage, backup coverage) plus one guarded write: create a Home Assistant OS or Ubuntu VM (plan by default, --apply --yes to write).",
+  "description": "Proxmox VE view (read-only: node status, VMs, inventory, tasks, task logs, backups, storage, backup coverage, firewall) plus guarded writes: create a Home Assistant OS or Ubuntu VM, and lock one VM behind the Proxmox firewall (inbound DROP). Plan by default, --apply --yes to write.",
   "cli": {
     "command": "proxmox",
-    "help": "maw proxmox [status|vms|vm <vmid>|inventory|tasks [--failed] [--limit N]|task-log <upid>|backups|ours|storage|create haos|ubuntu --vmid N --name NAME --ip A.B.C.D/24 [--apply --yes]] [--json] [--insecure] [--debug]"
+    "help": "maw proxmox [status|vms|vm <vmid>|inventory|tasks [--failed] [--limit N]|task-log <upid>|backups|ours|storage|firewall [<vmid>]|firewall lock|unlock <vmid> --name NAME [--apply --yes]|create haos|ubuntu --vmid N --name NAME --ip A.B.C.D/24 [--apply --yes]] [--json] [--insecure] [--debug]"
   },
   "capabilities": [
     "net:fetch",

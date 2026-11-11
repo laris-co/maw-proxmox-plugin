@@ -297,8 +297,10 @@ test("allowed_nets etc. can be saved with config set", async () => {
   expect(plan.ok).toBe(true);
 });
 
-test("all write code lives in create.ts", () => {
+test("all write code lives in create.ts (firewall.ts reuses its send)", () => {
   const src = readFileSync(join(import.meta.dir, "create.ts"), "utf8");
   for (const s of ["/resize", "/status/start", "/sendkey", "\"PUT\"", "\"POST\""]) expect(src.includes(s)).toBe(true);
   for (const bad of ["/status/stop", "/status/shutdown", "/status/reboot", "\"DELETE\"", "/clone", "vzdump"]) expect(src.includes(bad)).toBe(false);
+  const fw = readFileSync(join(import.meta.dir, "firewall.ts"), "utf8");
+  for (const bad of ["\"POST\"", "\"DELETE\"", "/status/", "/clone", "vzdump", "fetchRaw", "/resize", "/sendkey"]) expect(fw.includes(bad)).toBe(false);
 });

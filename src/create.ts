@@ -1,4 +1,4 @@
-// maw proxmox create — the ONLY write path in this plugin.
+// maw proxmox create — guarded VM creation. Writes live only here and in src/firewall.ts (which reuses send()).
 //
 //   maw proxmox create haos   --vmid N --name NAME --ip A.B.C.D/24 [options] [--apply --yes]
 //   maw proxmox create ubuntu --vmid N --name NAME --ip A.B.C.D/24 --ssh-key PATH [options] [--apply --yes]
@@ -344,7 +344,7 @@ export function renderPlan(o: CreateOpts, node: string, checks: Check[], calls: 
 }
 
 // ---------- apply ----------
-async function send(api: Api, method: "POST" | "PUT", path: string, params: Record<string, string> = {}): Promise<any> {
+export async function send(api: Api, method: "POST" | "PUT", path: string, params: Record<string, string> = {}): Promise<any> {
   const h = await api.writeHeaders();
   const r = await api.fetchRaw(path, { method, body: new URLSearchParams(params), headers: { ...h, "Content-Type": "application/x-www-form-urlencoded" } });
   const text = await r.text();
