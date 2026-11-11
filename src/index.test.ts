@@ -314,3 +314,11 @@ test("inventory: what every VM is, ours mark, backup age", async () => {
   expect(r.output).toMatch(/201 .*\*/);
   expect(calls.every((c) => c.method === "GET")).toBe(true);
 });
+
+test("inventory --only-ours keeps only the listed VMs; refuses without a list", async () => {
+  const env = { ...TOKEN_ENV, PVE_NODE: "pve-a" };
+  const a = await go(["inventory", "--only-ours", "--ours", "201"], env);
+  expect(a.r.ok).toBe(true); expect(a.r.output).toContain("vm-a"); expect(a.r.output).not.toContain("vm-b");
+  const b = await go(["inventory", "--mine"], env);
+  expect(b.r.ok).toBe(false); expect(b.r.error).toMatch(/needs a VM list/);
+});

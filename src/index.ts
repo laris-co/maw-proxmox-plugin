@@ -39,7 +39,7 @@ const HELP = `maw proxmox — read-only Proxmox VE view
   maw proxmox status                        node cpu / mem / rootfs / uptime / version
   maw proxmox vms                           all qemu VMs: vmid name status cpus mem uptime
   maw proxmox vm <vmid>                     status/current + config of one VM
-  maw proxmox inventory                     every VM: what it is (note, os, tags), size, ours, backup age
+  maw proxmox inventory [--only-ours]       every VM: what it is (note, os, tags), size, ours, backup age
   maw proxmox tasks [--failed] [--limit N]  recent tasks (default 50); failed ones marked FAIL
   maw proxmox task-log <upid>               log lines of one task
   maw proxmox backups                       backup jobs + backup archives on every storage
@@ -63,11 +63,12 @@ const HELP = `maw proxmox — read-only Proxmox VE view
 // ---------- args ----------
 export function parse(args: string[]) {
   const rest: string[] = [];
-  let json = false, failed = false, insecure = false, debug = false, limit = 50, ours: string | undefined;
+  let json = false, failed = false, insecure = false, debug = false, onlyOurs = false, limit = 50, ours: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--json") json = true;
     else if (a === "--failed") failed = true;
+    else if (a === "--only-ours" || a === "--mine") onlyOurs = true;
     else if (a === "--insecure" || a === "-k") insecure = true;
     else if (a === "--debug") debug = true;
     else if (a === "--limit" || a === "-n") limit = Number(args[++i] ?? limit);
@@ -78,7 +79,7 @@ export function parse(args: string[]) {
     else rest.push(a);
   }
   if (!Number.isFinite(limit) || limit < 1) limit = 50;
-  return { verb: rest[0] ?? "help", rest: rest.slice(1), json, failed, insecure, debug, limit: Math.floor(limit), ours };
+  return { verb: rest[0] ?? "help", rest: rest.slice(1), json, failed, insecure, debug, onlyOurs, limit: Math.floor(limit), ours };
 }
 
 export function baseUrl(host: string | undefined): string {
@@ -354,7 +355,8 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
       const files = await backupFiles(api).catch(() => [] as J[]);
       const ours = vmidList(o.ours ?? d.env.PVE_OURS);
       const nowS = Math.floor(Date.now() / 1000);
-      const rows = vms.map((v, i) => {
+      if (o.onlyOurs && !ours.length) return fail("--only-ours needs a VM list: maw proxmox config set ours=101,102 (or --ours 101,102)");
+      const rowsAll = vms.map((v, i) => {
         const c = cfgs[i] ?? {};
         const id = Number(v.vmid);
         const covered = jobs.some((j) => jobCovers(j, id));
@@ -367,6 +369,7 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
           backup_newest: newest || null, backup_age_days: newest ? Math.floor((nowS - newest) / 86400) : null,
         };
       });
+      const rows = o.onlyOurs ? rowsAll.filter((x) => x.ours) : rowsAll;
       if (o.json) return js(rows);
       return ok(table(["vmid", "name", "status", "ours", "cpus", "mem", "disk", "os", "backup", "note"],
         rows.map((r) => [r.vmid, String(r.name ?? "").slice(0, 26), r.status, r.ours ? "*" : "", r.cpus, bytes(r.maxmem), bytes(r.maxdisk),

@@ -29,7 +29,7 @@ After the first login the ticket is cached for ~1h50m (`~/.cache/maw-proxmox/tic
 maw proxmox status                        node cpu / mem / rootfs / uptime / version
 maw proxmox vms                           all qemu VMs: vmid name status cpus mem uptime
 maw proxmox vm <vmid>                     status/current + config of one VM
-maw proxmox inventory                     every VM: what it is (note, os, tags), size, ours, backup age
+maw proxmox inventory [--only-ours]       every VM: what it is (note, os, tags), size, ours, backup age
 maw proxmox tasks [--failed] [--limit N]  recent tasks (default 50); failed ones marked FAIL
 maw proxmox task-log <upid>               log lines of one task
 maw proxmox backups                       backup jobs + backup archives on every storage
