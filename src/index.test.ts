@@ -139,9 +139,14 @@ test("ticket login failure is reported", async () => {
   expect(r.error).toMatch(/ticket login failed: HTTP 401/);
 });
 
-test("only GET requests (besides the ticket POST) across every command", async () => {
+test("only GET requests (besides the ticket POST) across every command except create", async () => {
   const m = mock();
-  for (const a of [["status"], ["vms"], ["vm", "201"], ["tasks"], ["tasks", "--failed"], ["task-log", FAILED_UPID], ["backups"], ["ours", "--ours", "201,203"], ["storage"]]) {
+  const cmds = [["status"], ["vms"], ["vm", "201"], ["inventory"], ["tasks"], ["tasks", "--failed"], ["task-log", FAILED_UPID], ["backups"], ["ours", "--ours", "201,203"], ["storage"]];
+  // every non-create verb in the dispatcher must be exercised here
+  const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+  const known = JSON.parse(/const known = (\[[^\]]+\])/.exec(src)![1]!) as string[];
+  expect(known.filter((v) => v !== "create").sort()).toEqual([...new Set(cmds.map((c) => c[0]!))].sort());
+  for (const a of cmds) {
     const { r } = await go(a, TOKEN_ENV, m);
     expect(r.ok).toBe(true);
   }
@@ -203,10 +208,11 @@ test("storage table", async () => {
 
 test("help and unknown command", async () => {
   expect((await go(["--help"])).r.output).toContain("read-only");
+  expect((await go(["--help"])).r.output).toContain("--apply --yes");
   expect((await go(["start", "201"])).r.ok).toBe(false);
 });
 
-test("source has no write endpoints", () => {
+test("index.ts has no write endpoints (they live only in create.ts)", () => {
   const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
   for (const bad of ["/status/start", "/status/stop", "/status/shutdown", "/status/reboot", "method: \"PUT\"", "method: \"DELETE\"", "vzdump\"", "/clone", "/resize"]) {
     expect(src.includes(bad)).toBe(false);
