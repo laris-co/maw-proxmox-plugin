@@ -1,6 +1,6 @@
 # maw-proxmox-plugin
 
-`maw proxmox` is a **read-only** view of a Proxmox VE host through its REST API (`/api2/json`), plus one guarded write command, `maw proxmox create`, that makes a new Home Assistant OS or Ubuntu VM (plan by default, see [Creating VMs (write)](#creating-vms-write)).
+`maw proxmox` is a **read-only** view of a Proxmox VE host through its REST API (`/api2/json`), plus two guarded write commands, both plan-by-default: `maw proxmox create` makes a new Home Assistant OS or Ubuntu VM (see [Creating VMs (write)](#creating-vms-write)), and `maw proxmox firewall lock` drops all inbound traffic to one VM at the Proxmox firewall (see [Firewall lock (write)](#firewall-lock-write)).
 
 ## Install
 
@@ -35,7 +35,9 @@ maw proxmox task-log <upid>               log lines of one task
 maw proxmox backups                       backup jobs + backup archives on every storage
 maw proxmox ours [--ours 1,2,3]           only the listed VMs (default $PVE_OURS) with backup coverage
 maw proxmox storage                       storage pools: used / total
-maw proxmox create haos|ubuntu ...        new VM: plan only unless --apply --yes (the only write)
+maw proxmox firewall [<vmid>]             firewall state: datacenter / node / VMs with a NIC firewall=1
+maw proxmox create haos|ubuntu ...        new VM: plan only unless --apply --yes
+maw proxmox firewall lock|unlock <vmid> --name NAME   VM inbound DROP on/off: plan only unless --apply --yes
 
 --json  JSON output    --insecure  accept a self-signed cert    --debug  auth diagnostics (lengths/booleans only)
 ```
@@ -72,7 +74,7 @@ PVE_PASSWORD="$(pass show <your-entry>)" maw proxmox vms
 
 ## Read-only, on purpose
 
-Every command except `create` sends only `GET` requests (plus the login `POST`). There is no start, stop, shutdown, reboot, clone, delete, backup-now or config-write call for an existing VM anywhere in the code. All write calls live in `src/create.ts`; a test fails if `src/index.ts` gains one, and another runs every other command and fails on any non-GET request.
+Every command except `create` and `firewall lock|unlock` sends only `GET` requests (plus the login `POST`); plain `firewall` and `firewall <vmid>` are read-only too. There is no start, stop, shutdown, reboot, clone, delete or backup-now call anywhere in the code. The only config write to an existing VM is `firewall lock` adding `firewall=1` to its NICs. All write calls live in `src/create.ts` and `src/firewall.ts` (which reuses create's `send`); a test fails if `src/index.ts` gains one, and another runs every read command and fails on any non-GET request.
 
 A host may run VMs that belong to someone else (for example a client's VM). Any future write command must refuse VMs outside an explicit allow-list, and acting on a VM that is not yours needs the host owner's sign-off first.
 
@@ -107,6 +109,38 @@ Options: `--gw --dns --cores (2) --ram MiB (2048) --disk GiB (haos 48, ubuntu 40
 
 With ticket auth, writes send the `CSRFPreventionToken` from the login (API tokens need none). The account needs `VM.Allocate`, `VM.Config.*`, `VM.PowerMgmt`, `VM.Console` and `Datastore.AllocateSpace` on the target storage. `create` never modifies or deletes an existing VM; if a step fails it stops and leaves the half-made VM for a human to inspect.
 
+## Firewall lock (write)
+
+Make one VM reachable only through connections it starts itself (for example a Tailscale tunnel): every inbound connection is dropped at the Proxmox firewall.
+
+```
+maw proxmox firewall                                   # read-only: datacenter, node, VMs with a NIC firewall=1
+maw proxmox firewall 120                               # read-only: one VM's firewall options, rules, net* lines
+maw proxmox firewall lock 120 --name ha-test           # plan only
+maw proxmox firewall lock 120 --name ha-test --apply --yes
+maw proxmox firewall unlock 120 --name ha-test --apply --yes   # rollback
+```
+
+Proxmox returns `{}` for options left at their defaults, shown in words: datacenter `default (off)`, node `default (on when datacenter on)`, VM `off`. A VM is filtered only when the datacenter firewall is on, the VM's own firewall is on, and the NIC has `firewall=1`.
+
+**Plan is the default**, as with `create`: checks with PASS/FAIL and the exact calls are printed, nothing is written. Writes need **both** `--apply` and `--yes` and every check passing.
+
+**Checks for `lock`.**
+
+1. The VM exists and its name equals `--name` (otherwise refused: the wrong VM is never touched).
+2. If `ours` is configured (or `--ours 1,2,3` is given), the VM is in it.
+3. The host is never filtered: the node firewall is already `enable=0`, or the plan sets it to 0 first.
+4. No other guest (qemu or lxc) starts being filtered when the datacenter firewall goes on: any guest with its own firewall on and a NIC with `firewall=1` is listed by name and the lock is refused. If the datacenter firewall is already on, nothing else changes state and this passes.
+
+**What `lock` sends, in order** (each skipped when already in that state, so a locked VM is a no-op):
+
+1. `PUT /nodes/{node}/firewall/options enable=0`
+2. `PUT /nodes/{node}/qemu/{vmid}/config net<N>=<existing value>,firewall=1` for each NIC without it; the existing value is kept byte-for-byte (an explicit `firewall=0` is flipped in place)
+3. `PUT /nodes/{node}/qemu/{vmid}/firewall/options enable=1 policy_in=DROP policy_out=ACCEPT`
+4. `PUT /cluster/firewall/options enable=1`
+
+The plan ends with the rollback command. `unlock` sends only `PUT /nodes/{node}/qemu/{vmid}/firewall/options enable=0`. It leaves the datacenter firewall on, because other VMs may rely on it later; turn it off by hand (Datacenter > Firewall > Options) when nothing needs it. The account needs `Sys.Modify` (datacenter and node options) and `VM.Config.Network` on the VM.
+
 ## Notes
 
 - `tasks --failed` uses the API's `errors=1` filter. A failed scheduled backup shows as type `vzdump` with a status such as `job errors`; read the details with `maw proxmox task-log <upid>` (get the upid from `tasks --failed --json`).
@@ -118,6 +152,6 @@ With ticket auth, writes send the `CSRFPreventionToken` from the login (API toke
 
 ```
 ghq get https://github.com/laris-co/maw-proxmox-plugin
-maw plugin install ~/Code/github.com/laris-co/maw-proxmox-plugin
+cd ~/Code/github.com/laris-co/maw-proxmox-plugin
 bun test
 ```

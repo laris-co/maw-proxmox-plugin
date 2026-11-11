@@ -34,6 +34,12 @@ const FIX: Record<string, unknown> = {
     { volid: "store-b:backup/vzdump-qemu-201-new.vma.zst", vmid: 201, size: 2 ** 31, ctime: 1731200000 },
   ],
   "/nodes/pve-a/storage": [{ storage: "store-b", type: "dir", active: 1, used: 25, total: 100, avail: 75, content: "backup,iso" }],
+  "/cluster/firewall/options": {},
+  "/cluster/firewall/rules": [],
+  "/nodes/pve-a/firewall/options": {},
+  "/nodes/pve-a/firewall/rules": [],
+  "/nodes/pve-a/qemu/201/firewall/options": {},
+  "/nodes/pve-a/qemu/201/firewall/rules": [],
 };
 
 type Call = { url: string; method: string; headers: Record<string, string>; body?: string; tls?: unknown };
@@ -141,7 +147,7 @@ test("ticket login failure is reported", async () => {
 
 test("only GET requests (besides the ticket POST) across every command except create", async () => {
   const m = mock();
-  const cmds = [["status"], ["vms"], ["vm", "201"], ["inventory"], ["tasks"], ["tasks", "--failed"], ["task-log", FAILED_UPID], ["backups"], ["ours", "--ours", "201,203"], ["storage"]];
+  const cmds = [["status"], ["vms"], ["vm", "201"], ["inventory"], ["tasks"], ["tasks", "--failed"], ["task-log", FAILED_UPID], ["backups"], ["ours", "--ours", "201,203"], ["storage"], ["firewall"], ["firewall", "201"], ["firewall", "--json"]];
   // every non-create verb in the dispatcher must be exercised here
   const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
   const known = JSON.parse(/const known = (\[[^\]]+\])/.exec(src)![1]!) as string[];

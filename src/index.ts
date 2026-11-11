@@ -10,10 +10,13 @@
 //   maw proxmox storage                      pools: used / total
 //   --json  machine output   --insecure  accept a self-signed cert   --debug  auth diagnostics (no secrets)
 //
-//   maw proxmox create haos|ubuntu ...      the ONLY write path (src/create.ts): plan by default, writes need --apply --yes
+//   maw proxmox firewall [<vmid>]            firewall state: datacenter, node, VMs with NIC firewall=1 (GET only)
+//
+//   maw proxmox create haos|ubuntu ...      write (src/create.ts): plan by default, writes need --apply --yes
+//   maw proxmox firewall lock|unlock ...    write (src/firewall.ts): plan by default, writes need --apply --yes
 //
 // Every other command only sends GET requests, plus POST /access/ticket to log in. All write calls live in
-// src/create.ts; this file holds none.
+// src/create.ts and src/firewall.ts; this file holds none.
 //
 // Nothing about any particular host lives in this file. Everything comes from the environment:
 //   PVE_HOST          required. host, host:port or https://host:port (port defaults to 8006)
@@ -26,6 +29,7 @@
 //   PVE_BRIDGE        guards and defaults for `create`
 
 import { runCreate, type CreateDeps, type ProbeResult } from "./create";
+import { runFirewall } from "./firewall";
 
 type InvokeContext = { source: "cli" | string; args: string[] };
 type PluginResult = { ok: boolean; output?: string; error?: string };
@@ -40,7 +44,7 @@ export type Store = {
 type Deps = { env: Env; fetch: FetchFn; pass: PassFn; log: (s: string) => void; store?: Store; create?: Partial<CreateDeps> };
 type J = Record<string, any>;
 
-const HELP = `maw proxmox — Proxmox VE view (read-only) + guarded VM creation
+const HELP = `maw proxmox — Proxmox VE view (read-only) + guarded VM creation and VM firewall lock
 
   maw proxmox status                        node cpu / mem / rootfs / uptime / version
   maw proxmox vms                           all qemu VMs: vmid name status cpus mem uptime
@@ -51,6 +55,8 @@ const HELP = `maw proxmox — Proxmox VE view (read-only) + guarded VM creation
   maw proxmox backups                       backup jobs + backup archives on every storage
   maw proxmox ours [--ours 1,2,3]           only the listed VMs (default $PVE_OURS) with backup coverage
   maw proxmox storage                       storage pools: used / total
+  maw proxmox firewall [<vmid>]             firewall: datacenter / node enable + rule counts, VMs with a NIC
+                                            firewall=1; with <vmid>: its options, rules and net* lines
 
   maw proxmox create haos   --vmid N --name NAME --ip A.B.C.D/24 [--gw IP] [--dns IP,IP] [--cores 2] [--ram 2048]
                             [--disk 48] [--image haos_ova-18.2.qcow2] [--storage-vm ssd] [--storage-img local]
@@ -62,6 +68,15 @@ const HELP = `maw proxmox — Proxmox VE view (read-only) + guarded VM creation
       vmid + name free, ip inside allowed_nets and not in deny_nets, ip silent (tcp 22/80/443 + ping) and not on
       any guest, RAM headroom (running maxmem + new <= physical - ram_reserve_gib), storage >= disk + 10%,
       image present in <storage-img>:import/, ubuntu: --ssh-key is a public key.
+
+  maw proxmox firewall lock   <vmid> --name NAME [--apply --yes]
+      drop all inbound traffic to one VM (outbound-started traffic, e.g. Tailscale, still works). PLAN by default.
+      checks: VM exists and is named NAME, in ours (if set), host firewall off first, no other VM starts being
+      filtered when the datacenter firewall goes on. calls, in order (each skipped if already so):
+      PUT node firewall enable=0, PUT VM config net<N>=<same value>,firewall=1,
+      PUT VM firewall enable=1 policy_in=DROP policy_out=ACCEPT, PUT datacenter firewall enable=1
+  maw proxmox firewall unlock <vmid> --name NAME [--apply --yes]
+      PUT VM firewall enable=0. The datacenter firewall is left on (turn it off by hand if nothing needs it).
 
   maw proxmox config                        show saved settings (and the file path)
   maw proxmox config set k=v [k=v ...]      save: host node user pass_entry token_id insecure ours
@@ -76,7 +91,8 @@ const HELP = `maw proxmox — Proxmox VE view (read-only) + guarded VM creation
        PVE_OURS  vmid list for 'ours'
   saved config (~/.config/maw-proxmox/config.json) fills in anything env leaves unset; env always wins.
   passwords / token secrets are never saved; a ticket login is cached ~1h50m (0600) and reused.
-  every command except 'create' is read-only (GET only). 'create' never touches an existing VM.`;
+  every command except 'create' and 'firewall lock|unlock' is read-only (GET only). 'create' never touches an
+  existing VM; 'firewall lock|unlock' touches only firewall settings and the named VM's NIC firewall flag.`;
 
 // ---------- args ----------
 export function parse(args: string[]) {
@@ -339,7 +355,7 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
   if (o.verb === "logout") { d.store?.writeTicket(null); return ok("cached ticket removed"); }
 
   if (d.store) d = { ...d, env: mergeEnv(d.env, d.store.readConfig()) };
-  const known = ["status", "vms", "vm", "inventory", "tasks", "task-log", "backups", "ours", "storage", "create"];
+  const known = ["status", "vms", "vm", "inventory", "tasks", "task-log", "backups", "ours", "storage", "firewall", "create"];
   if (!known.includes(o.verb)) return fail(`unknown command: ${o.verb}\n\n${HELP}`);
 
   try {
@@ -347,6 +363,7 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
     const api = new Api(d, o.insecure || truthy(d.env.PVE_INSECURE));
 
     if (o.verb === "create") return await runCreate(api, o.rest, { ...realCreateDeps(), env: d.env, log: d.log, ...d.create } as CreateDeps);
+    if (o.verb === "firewall") return await runFirewall(api, o.rest, { env: o.ours !== undefined ? { ...d.env, PVE_OURS: o.ours } : d.env, log: d.log, json: o.json });
 
     if (o.verb === "status") {
       const s = await api.n("/status") as J;
