@@ -53,7 +53,19 @@ A host may run VMs that belong to someone else (for example a client's VM). Any 
 
 ## Install
 
+One line, straight from GitHub (no clone needed):
+
 ```
-maw plugin install /path/to/maw-proxmox-plugin
+maw plugin install laris-co/maw-proxmox-plugin
+maw proxmox --help
+```
+
+Update later with `maw plugin update proxmox`.
+
+From a local checkout instead (for development):
+
+```
+ghq get https://github.com/laris-co/maw-proxmox-plugin
+maw plugin install ~/Code/github.com/laris-co/maw-proxmox-plugin
 bun test
 ```
