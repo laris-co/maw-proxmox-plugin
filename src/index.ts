@@ -10,8 +10,10 @@
 //   maw proxmox storage                      pools: used / total
 //   --json  machine output   --insecure  accept a self-signed cert   --debug  auth diagnostics (no secrets)
 //
-// v1 only ever sends GET requests, plus POST /access/ticket to log in. There is no code path that starts,
-// stops, creates, deletes or reconfigures anything.
+//   maw proxmox create haos|ubuntu ...      the ONLY write path (src/create.ts): plan by default, writes need --apply --yes
+//
+// Every other command only sends GET requests, plus POST /access/ticket to log in. All write calls live in
+// src/create.ts; this file holds none.
 //
 // Nothing about any particular host lives in this file. Everything comes from the environment:
 //   PVE_HOST          required. host, host:port or https://host:port (port defaults to 8006)
@@ -20,6 +22,10 @@
 //   PVE_TOKEN_ID + PVE_TOKEN_SECRET     API token auth (preferred)
 //   PVE_USER + PVE_PASSWORD             ticket login, or PVE_USER + PVE_PASS_ENTRY (read with `pass show`)
 //   PVE_OURS          comma/space list of vmids for `ours`
+//   PVE_ALLOWED_NETS / PVE_DENY_NETS / PVE_RAM_RESERVE_GIB / PVE_GW / PVE_DNS / PVE_STORAGE_VM / PVE_STORAGE_IMG /
+//   PVE_BRIDGE        guards and defaults for `create`
+
+import { runCreate, type CreateDeps, type ProbeResult } from "./create";
 
 type InvokeContext = { source: "cli" | string; args: string[] };
 type PluginResult = { ok: boolean; output?: string; error?: string };
@@ -31,10 +37,10 @@ export type Store = {
   readTicket(): J | null; writeTicket(t: J | null): void;
   now(): number;
 };
-type Deps = { env: Env; fetch: FetchFn; pass: PassFn; log: (s: string) => void; store?: Store };
+type Deps = { env: Env; fetch: FetchFn; pass: PassFn; log: (s: string) => void; store?: Store; create?: Partial<CreateDeps> };
 type J = Record<string, any>;
 
-const HELP = `maw proxmox — read-only Proxmox VE view
+const HELP = `maw proxmox — Proxmox VE view (read-only) + guarded VM creation
 
   maw proxmox status                        node cpu / mem / rootfs / uptime / version
   maw proxmox vms                           all qemu VMs: vmid name status cpus mem uptime
@@ -46,8 +52,20 @@ const HELP = `maw proxmox — read-only Proxmox VE view
   maw proxmox ours [--ours 1,2,3]           only the listed VMs (default $PVE_OURS) with backup coverage
   maw proxmox storage                       storage pools: used / total
 
+  maw proxmox create haos   --vmid N --name NAME --ip A.B.C.D/24 [--gw IP] [--dns IP,IP] [--cores 2] [--ram 2048]
+                            [--disk 48] [--image haos_ova-18.2.qcow2] [--storage-vm ssd] [--storage-img local]
+                            [--bridge vmbr0] [--iface enp6s18] [--wait-min 5] [--apply --yes]
+  maw proxmox create ubuntu --vmid N --name NAME --ip A.B.C.D/24 --ssh-key PATH [--ciuser ubuntu] [--disk 40]
+                            [--image noble-server-cloudimg-amd64.qcow2] [same options as haos] [--apply --yes]
+      default = PLAN ONLY: runs every check and prints the exact API calls, writes nothing.
+      writes only with BOTH --apply and --yes, and only when every check passes:
+      vmid + name free, ip inside allowed_nets and not in deny_nets, ip silent (tcp 22/80/443 + ping) and not on
+      any guest, RAM headroom (running maxmem + new <= physical - ram_reserve_gib), storage >= disk + 10%,
+      image present in <storage-img>:import/, ubuntu: --ssh-key is a public key.
+
   maw proxmox config                        show saved settings (and the file path)
   maw proxmox config set k=v [k=v ...]      save: host node user pass_entry token_id insecure ours
+                                            allowed_nets deny_nets ram_reserve_gib gw dns storage_vm storage_img bridge
   maw proxmox config unset <key>            remove one saved setting
   maw proxmox logout                        forget the cached login ticket
 
@@ -58,7 +76,7 @@ const HELP = `maw proxmox — read-only Proxmox VE view
        PVE_OURS  vmid list for 'ours'
   saved config (~/.config/maw-proxmox/config.json) fills in anything env leaves unset; env always wins.
   passwords / token secrets are never saved; a ticket login is cached ~1h50m (0600) and reused.
-  read-only: no start/stop/create/delete/config-write calls exist in this plugin.`;
+  every command except 'create' is read-only (GET only). 'create' never touches an existing VM.`;
 
 // ---------- args ----------
 export function parse(args: string[]) {
@@ -103,6 +121,8 @@ const truthy = (v: string | undefined) => !!v && /^(1|true|yes|on)$/i.test(v);
 export const CONFIG_KEYS: Record<string, string> = {
   host: "PVE_HOST", node: "PVE_NODE", user: "PVE_USER", pass_entry: "PVE_PASS_ENTRY",
   token_id: "PVE_TOKEN_ID", insecure: "PVE_INSECURE", ours: "PVE_OURS",
+  allowed_nets: "PVE_ALLOWED_NETS", deny_nets: "PVE_DENY_NETS", ram_reserve_gib: "PVE_RAM_RESERVE_GIB",
+  gw: "PVE_GW", dns: "PVE_DNS", storage_vm: "PVE_STORAGE_VM", storage_img: "PVE_STORAGE_IMG", bridge: "PVE_BRIDGE",
 };
 const SECRET_KEYS = ["password", "pass", "token_secret", "secret", "ticket"];
 
@@ -161,11 +181,13 @@ export class Api {
   node?: string;
   auth?: Auth;
   cachedTicket = false;
+  /** CSRFPreventionToken from the ticket login; required on POST/PUT with ticket auth (token auth needs none). */
+  csrf?: string;
   constructor(private d: Deps, private insecure: boolean) {
     this.base = baseUrl(d.env.PVE_HOST);
     this.node = d.env.PVE_NODE || undefined;
   }
-  private init(extra: RequestInit = {}) {
+  init(extra: RequestInit = {}) {
     return { ...extra, ...(this.insecure ? { tls: { rejectUnauthorized: false } } : {}) };
   }
   async login(): Promise<Auth> {
@@ -178,6 +200,7 @@ export class Api {
     const cached = st?.readTicket();
     if (cached && cached.base === this.base && cached.user === e.PVE_USER && Number(cached.expires) > (st!.now())) {
       this.cachedTicket = true;
+      this.csrf = cached.csrf || undefined;
       return (this.auth = { kind: "ticket", headers: { Cookie: `PVEAuthCookie=${cached.ticket}` } });
     }
     let pw = e.PVE_PASSWORD;
@@ -186,10 +209,12 @@ export class Api {
     const body = new URLSearchParams({ username: e.PVE_USER, password: pw });
     const r = await this.d.fetch(`${this.base}/access/ticket`, this.init({ method: "POST", body, headers: { "Content-Type": "application/x-www-form-urlencoded" } }));
     if (!r.ok) throw new Error(`ticket login failed: HTTP ${r.status} (check PVE_USER / password)`);
-    const t = ((await r.json()) as J)?.data?.ticket;
+    const data = ((await r.json()) as J)?.data;
+    const t = data?.ticket;
     if (!t) throw new Error("ticket login failed: no ticket in response");
+    this.csrf = data?.CSRFPreventionToken || undefined;
     // Proxmox tickets live 2h; reuse for 1h50m.
-    st?.writeTicket({ base: this.base, user: e.PVE_USER, ticket: t, expires: st.now() + 110 * 60 * 1000 });
+    st?.writeTicket({ base: this.base, user: e.PVE_USER, ticket: t, csrf: this.csrf, expires: st.now() + 110 * 60 * 1000 });
     return (this.auth = { kind: "ticket", headers: { Cookie: `PVEAuthCookie=${t}` } });
   }
   async get<T = any>(path: string): Promise<T> {
@@ -205,6 +230,19 @@ export class Api {
     if (!r.ok) throw new Error(`HTTP ${r.status} on ${path}: ${(await r.text()).slice(0, 200)}`);
     return ((await r.json()) as J).data as T;
   }
+  /** Auth headers for a POST/PUT: ticket auth adds the CSRF token (a cached ticket without one forces a fresh login). */
+  async writeHeaders(): Promise<Record<string, string>> {
+    let a = await this.login();
+    if (a.kind === "token") return a.headers;
+    if (!this.csrf) {
+      this.d.store?.writeTicket(null); this.auth = undefined; this.cachedTicket = false;
+      a = await this.login();
+    }
+    if (!this.csrf) throw new Error("ticket login returned no CSRFPreventionToken; refusing to write");
+    return { ...a.headers, CSRFPreventionToken: this.csrf };
+  }
+  /** Raw request for src/create.ts (the only caller that writes). */
+  fetchRaw(path: string, init: RequestInit) { return this.d.fetch(`${this.base}${path}`, this.init(init)); }
   async nodeName(): Promise<string> {
     if (this.node) return this.node;
     const ns = await this.get<J[]>("/nodes");
@@ -301,12 +339,14 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
   if (o.verb === "logout") { d.store?.writeTicket(null); return ok("cached ticket removed"); }
 
   if (d.store) d = { ...d, env: mergeEnv(d.env, d.store.readConfig()) };
-  const known = ["status", "vms", "vm", "inventory", "tasks", "task-log", "backups", "ours", "storage"];
+  const known = ["status", "vms", "vm", "inventory", "tasks", "task-log", "backups", "ours", "storage", "create"];
   if (!known.includes(o.verb)) return fail(`unknown command: ${o.verb}\n\n${HELP}`);
 
   try {
     if (o.debug) d.log(`[debug] ${JSON.stringify(describeCreds(d.env))}`);
     const api = new Api(d, o.insecure || truthy(d.env.PVE_INSECURE));
+
+    if (o.verb === "create") return await runCreate(api, o.rest, { ...realCreateDeps(), env: d.env, log: d.log, ...d.create } as CreateDeps);
 
     if (o.verb === "status") {
       const s = await api.n("/status") as J;
@@ -442,6 +482,37 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
 }
 
 // ---------- real deps ----------
+export function tcpProbe(host: string, port: number, timeoutMs: number): Promise<ProbeResult> {
+  const net = require("node:net") as typeof import("node:net");
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    let done = false;
+    const end = (r: ProbeResult) => { if (!done) { done = true; s.destroy(); resolve(r); } };
+    s.setTimeout(timeoutMs, () => end("silent"));
+    s.once("connect", () => end("open"));
+    s.once("error", (e: NodeJS.ErrnoException) => end(e.code === "ECONNREFUSED" ? "refused" : "silent"));
+    s.connect(port, host);
+  });
+}
+async function pingOnce(host: string): Promise<boolean | null> {
+  if (!Bun.which("ping")) return null;
+  // macOS ping -W is milliseconds, Linux -W is seconds
+  const args = process.platform === "darwin" ? ["-c", "1", "-W", "1000"] : ["-c", "1", "-W", "1"];
+  const p = Bun.spawn(["ping", ...args, host], { stdout: "ignore", stderr: "ignore" });
+  const t = setTimeout(() => p.kill(), 3000);
+  const code = await p.exited;
+  clearTimeout(t);
+  return code === 0;
+}
+function realCreateDeps(): Omit<CreateDeps, "env" | "log"> {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const os = require("node:os") as typeof import("node:os");
+  return {
+    probe: tcpProbe, ping: pingOnce, sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    readFile: (p) => { try { return fs.readFileSync(p.replace(/^~(?=\/)/, os.homedir()), "utf8"); } catch { return null; } },
+    hostname: () => os.hostname(), today: () => new Date().toISOString().slice(0, 10),
+  };
+}
 function passShow(entry: string): string | null {
   try {
     const p = Bun.spawnSync(["pass", "show", entry], { stdout: "pipe", stderr: "pipe" });
