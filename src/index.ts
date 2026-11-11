@@ -39,6 +39,7 @@ const HELP = `maw proxmox — read-only Proxmox VE view
   maw proxmox status                        node cpu / mem / rootfs / uptime / version
   maw proxmox vms                           all qemu VMs: vmid name status cpus mem uptime
   maw proxmox vm <vmid>                     status/current + config of one VM
+  maw proxmox inventory                     every VM: what it is (note, os, tags), size, ours, backup age
   maw proxmox tasks [--failed] [--limit N]  recent tasks (default 50); failed ones marked FAIL
   maw proxmox task-log <upid>               log lines of one task
   maw proxmox backups                       backup jobs + backup archives on every storage
@@ -299,7 +300,7 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
   if (o.verb === "logout") { d.store?.writeTicket(null); return ok("cached ticket removed"); }
 
   if (d.store) d = { ...d, env: mergeEnv(d.env, d.store.readConfig()) };
-  const known = ["status", "vms", "vm", "tasks", "task-log", "backups", "ours", "storage"];
+  const known = ["status", "vms", "vm", "inventory", "tasks", "task-log", "backups", "ours", "storage"];
   if (!known.includes(o.verb)) return fail(`unknown command: ${o.verb}\n\n${HELP}`);
 
   try {
@@ -343,6 +344,33 @@ export async function run(args: string[], d: Deps): Promise<PluginResult> {
       ]);
       const conf = table(["key", "value"], Object.keys(cfg).filter((k) => k !== "digest").sort().map((k) => [k, cfg[k]]));
       return ok(`${head}\n\nconfig\n${conf}`);
+    }
+
+    if (o.verb === "inventory") {
+      // what every VM IS: name, size, OS, tags, the note its owner wrote, backup coverage. Read-only.
+      const vms = (await api.n("/qemu") as J[]).sort((a, b) => Number(a.vmid) - Number(b.vmid));
+      const cfgs = await Promise.all(vms.map((v) => api.n(`/qemu/${v.vmid}/config`).catch(() => ({})))) as J[];
+      const jobs = await api.get<J[]>("/cluster/backup").catch(() => [] as J[]);
+      const files = await backupFiles(api).catch(() => [] as J[]);
+      const ours = vmidList(o.ours ?? d.env.PVE_OURS);
+      const nowS = Math.floor(Date.now() / 1000);
+      const rows = vms.map((v, i) => {
+        const c = cfgs[i] ?? {};
+        const id = Number(v.vmid);
+        const covered = jobs.some((j) => jobCovers(j, id));
+        const mine = files.filter((f) => Number(f.vmid) === id);
+        const newest = mine.length ? Math.max(...mine.map((f) => Number(f.ctime ?? 0))) : 0;
+        const note = String(c.description ?? "").split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("<")) ?? "";
+        return {
+          vmid: id, name: v.name, status: v.status, ours: ours.includes(id), cpus: v.cpus, maxmem: v.maxmem, maxdisk: v.maxdisk,
+          ostype: c.ostype ?? "", tags: c.tags ?? "", note, backup_job: covered,
+          backup_newest: newest || null, backup_age_days: newest ? Math.floor((nowS - newest) / 86400) : null,
+        };
+      });
+      if (o.json) return js(rows);
+      return ok(table(["vmid", "name", "status", "ours", "cpus", "mem", "disk", "os", "backup", "note"],
+        rows.map((r) => [r.vmid, String(r.name ?? "").slice(0, 26), r.status, r.ours ? "*" : "", r.cpus, bytes(r.maxmem), bytes(r.maxdisk),
+          r.ostype || "-", !r.backup_job ? "none" : r.backup_age_days === null ? "no file" : `${r.backup_age_days}d`, r.note.slice(0, 60) || "-"])));
     }
 
     if (o.verb === "tasks") {

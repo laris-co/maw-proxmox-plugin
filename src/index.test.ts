@@ -303,3 +303,14 @@ test("writeAllSync writes every byte across partial writes and EAGAIN", () => {
   expect(out).toBe(big);
   expect(calls).toBeGreaterThan(3);
 });
+
+test("inventory: what every VM is, ours mark, backup age", async () => {
+  const m = mock();
+  FIX["/nodes/pve-a/qemu/202/config"] = { name: "vm-b", ostype: "l26", tags: "lab", description: "test box\nsecond line" };
+  FIX["/nodes/pve-a/qemu/203/config"] = { name: "vm-c", description: "" };
+  const { r, calls } = await go(["inventory", "--ours", "201"], { ...TOKEN_ENV, PVE_NODE: "pve-a" }, m);
+  expect(r.ok).toBe(true);
+  expect(r.output).toContain("vm-a"); expect(r.output).toContain("test box");
+  expect(r.output).toMatch(/201 .*\*/);
+  expect(calls.every((c) => c.method === "GET")).toBe(true);
+});
