@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { baseUrl, bytes, dur, jobCovers, mergeEnv, NO_CREDS, parse, run, table, taskState, vmidList, type Store } from "./index";
+import { baseUrl, bytes, dur, jobCovers, mergeEnv, NO_CREDS, parse, run, table, taskState, vmidList, writeAllSync, type Store } from "./index";
 
 // All values here are fake: pve.example.test, node "pve-a", VMs "vm-a"/"vm-b"/"vm-c".
 const HOST = "pve.example.test";
@@ -289,4 +289,17 @@ test("stale cached ticket (401) is dropped and login retried once", async () => 
   expect(st.ticket.ticket).toBe("PVE:fake-ticket");
   expect((await goS(["logout"], {}, store)).r.ok).toBe(true);
   expect(st.ticket).toBeNull();
+});
+
+test("writeAllSync writes every byte across partial writes and EAGAIN", () => {
+  const big = "x".repeat(200_000) + "ทดสอบ\n";
+  const got: Uint8Array[] = []; let calls = 0;
+  writeAllSync(1, big, (_fd, b) => {
+    calls++;
+    if (calls === 2) { const e: any = new Error("again"); e.code = "EAGAIN"; throw e; }
+    const n = Math.min(b.length, 65536); got.push(b.slice(0, n)); return n;
+  });
+  const out = new TextDecoder().decode(Buffer.concat(got));
+  expect(out).toBe(big);
+  expect(calls).toBeGreaterThan(3);
 });

@@ -445,8 +445,34 @@ export function fileStore(env: Env = process.env): Store {
   };
 }
 
+// maw prints a plugin's returned output and exits right away; when stdout is a pipe only the first
+// 64 KiB (one pipe buffer) gets out — `tasks --json --limit 300` was cut mid-string (2026-11-11).
+// Big CLI output is therefore written here, synchronously, before returning.
+export const DIRECT_WRITE_BYTES = 16 * 1024;
+export function writeAllSync(fd: number, text: string, write: (fd: number, b: Uint8Array) => number = defaultWrite): void {
+  const buf = new TextEncoder().encode(text);
+  let off = 0, spins = 0;
+  while (off < buf.length) {
+    try {
+      const n = write(fd, buf.subarray(off));
+      off += n; spins = 0;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EAGAIN" && spins++ < 10000) { Bun.sleepSync(1); continue; }
+      throw e;
+    }
+  }
+}
+function defaultWrite(fd: number, b: Uint8Array): number {
+  return (require("node:fs") as typeof import("node:fs")).writeSync(fd, b);
+}
+
 export async function handler(ctx: InvokeContext): Promise<PluginResult> {
-  return run(ctx.args, { env: process.env, fetch: fetch as unknown as FetchFn, pass: passShow, log: (s) => console.error(s), store: fileStore() });
+  const r = await run(ctx.args, { env: process.env, fetch: fetch as unknown as FetchFn, pass: passShow, log: (s) => console.error(s), store: fileStore() });
+  if (ctx.source === "cli" && r.output && r.output.length > DIRECT_WRITE_BYTES) {
+    writeAllSync(1, r.output.endsWith("\n") ? r.output : r.output + "\n");
+    return { ok: r.ok, ...(r.error ? { error: r.error } : {}) };
+  }
+  return r;
 }
 
 export default handler;
