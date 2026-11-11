@@ -1,0 +1,17 @@
+{
+  "name": "proxmox",
+  "version": "0.1.0",
+  "entry": "./src/index.ts",
+  "sdk": "^1.0.0",
+  "target": "js",
+  "description": "Read-only Proxmox VE view: node status, VMs, tasks (failed jobs), task logs, backup jobs and archives, storage, and backup coverage for a chosen list of VMs.",
+  "cli": {
+    "command": "proxmox",
+    "help": "maw proxmox [status|vms|vm <vmid>|tasks [--failed] [--limit N]|task-log <upid>|backups|ours|storage] [--json] [--insecure] [--debug]"
+  },
+  "capabilities": ["net:fetch", "proc:exec"],
+  "weight": 0,
+  "tier": "extra",
+  "license": "MIT",
+  "schemaVersion": 1
+}
