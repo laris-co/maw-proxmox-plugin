@@ -85,6 +85,10 @@ export function sendkeySequence(text: string): string[] {
   return out;
 }
 
+/** Sent before typing: release any modifier a console viewer left held, then clear the ha> line. */
+export const RESET_KEYS = ["shift", "shift_r", "ctrl", "ctrl_r", "alt", "alt_r", "ctrl-u"];
+export const KEY_DELAY_MS = 150;
+
 export function haosNetworkCommand(iface: string, ipCidr: string, gw: string, dns: string[]): string {
   return `network update ${iface} --ipv4-method static --ipv4-address ${ipCidr} --ipv4-gateway ${gw}` +
     dns.map((n) => ` --ipv4-nameserver ${n}`).join("");
@@ -393,7 +397,11 @@ export async function applyCreate(api: Api, o: CreateOpts, d: CreateDeps, node: 
     const keys = sendkeySequence(cmd);
     d.log(`typing on the console (${keys.length} keys): ${cmd}`);
     const sk = `/nodes/${encodeURIComponent(node)}/qemu/${o.vmid}/sendkey`;
-    for (const key of keys) { await send(api, "PUT", sk, { key }); await d.sleep(60); }
+    // A console viewer (noVNC) left open can inject a modifier mid-typing: a Cmd-Shift-4 screenshot on the
+    // human's Mac left Shift held and every key after it came out shifted (2026-11-11, VM 115). Release
+    // every modifier and clear the line first, and type slower than the proven 60 ms.
+    for (const key of RESET_KEYS) { await send(api, "PUT", sk, { key }); await d.sleep(200); }
+    for (const key of keys) { await send(api, "PUT", sk, { key }); await d.sleep(KEY_DELAY_MS); }
     await d.sleep(25000);
     const up = await waitFor(d, o.waitMin, async () => (await d.ping(ip)) === true || (await d.probe(ip, 4357, 2000)) !== "silent");
     summary.push(up === null ? `WARNING: ${ip} not answering after ${o.waitMin} min - open the console` : `${ip} answers (~${up + 25}s after typing)`);

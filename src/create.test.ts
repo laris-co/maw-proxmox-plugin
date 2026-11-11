@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { run, type Store } from "./index";
-import { encodeSshKeys, haosNetworkCommand, inNet, ip2int, looksLikePublicKey, ONBOARDING_WARNING, sendkeySequence, type ProbeResult } from "./create";
+import { RESET_KEYS, encodeSshKeys, haosNetworkCommand, inNet, ip2int, looksLikePublicKey, ONBOARDING_WARNING, sendkeySequence, type ProbeResult } from "./create";
 
 // All values are fake: pve.example.test, node "pve-a", documentation range 203.0.113.0/24, deny 198.51.100.0/24.
 const HOST = "pve.example.test";
@@ -212,9 +212,9 @@ test("apply haos: exact POST/PUT sequence, CSRF header on ticket auth, verify + 
   const keys = sendkeySequence(cmd);
   expect(w.map((c) => `${c.method} ${c.path}`)).toEqual([
     `POST ${N}/qemu`, `PUT ${N}/qemu/120/resize`, `POST ${N}/qemu/120/status/start`,
-    ...keys.map(() => `PUT ${N}/qemu/120/sendkey`),
+    ...[...RESET_KEYS, ...keys].map(() => `PUT ${N}/qemu/120/sendkey`),
   ]);
-  expect(w.slice(3).map((c) => new URLSearchParams(c.body).get("key"))).toEqual(keys);
+  expect(w.slice(3).map((c) => new URLSearchParams(c.body).get("key"))).toEqual([...RESET_KEYS, ...keys]);
   const p = new URLSearchParams(w[0]!.body);
   expect(Object.fromEntries(p)).toMatchObject({
     vmid: "120", name: "ha-test", ostype: "l26", machine: "q35", bios: "ovmf", efidisk0: "ssd:0,efitype=4m,pre-enrolled-keys=0",
